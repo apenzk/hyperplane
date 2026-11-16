@@ -2,7 +2,6 @@ use std::fs;
 
 use chrono::Local;
 use hyperplane::utils::logging;
-use hyperplane::hyper_ig::HyperIG;
 use std::time::{Duration, Instant};
 use toml;
 use serde_json;
@@ -88,9 +87,9 @@ pub async fn run_simple_simulation() -> Result<(), crate::config::ConfigError> {
 
         logging::log("SIMULATOR", "Setting up test nodes with preloaded accounts...");
         // Setup test nodes with preloaded accounts from config
-        let (hs_node, cl_node, hig_node_1, hig_node_2, _start_block_height) = crate::testnodes::setup_test_nodes(
+        let nodes = crate::testnodes::setup_test_nodes(
             Duration::from_secs_f64(config.network_config.block_interval),
-            &[0.0, 0.0], // Zero delays for funding
+            &vec![0.0; config.network_config.num_chains], // Zero delays for funding
             config.transaction_config.allow_cat_pending_dependencies,
             config.transaction_config.cat_lifetime_blocks,
             config.account_config.num_accounts.try_into().unwrap(), // Preload accounts from config
@@ -100,60 +99,18 @@ pub async fn run_simple_simulation() -> Result<(), crate::config::ConfigError> {
         
         logging::log("SIMULATOR", &format!("Test nodes setup complete with {} accounts preloaded with {} tokens each", 
             config.account_config.num_accounts, config.account_config.initial_balance));
-        
-        // Query and log account balances to verify preloading
-        logging::log("SIMULATOR", "=== Verifying Preloaded Account Balances ===");
-        
-        // Check chain-1 account balances
-        let chain_1_state = hig_node_1.lock().await.get_chain_state().await.unwrap();
-        logging::log("SIMULATOR", &format!("Chain-1 state: {} accounts with balances", chain_1_state.len()));
-        
-        // Log first few account balances as examples
-        let mut sorted_accounts: Vec<_> = chain_1_state.iter().collect();
-        sorted_accounts.sort_by_key(|(account_id, _)| account_id.parse::<u32>().unwrap_or(0));
-        
-        for (account_id, balance) in sorted_accounts.iter().take(10) {
-            logging::log("SIMULATOR", &format!("Chain-1 Account {}: {} tokens", account_id, balance));
-        }
-        if sorted_accounts.len() > 10 {
-            logging::log("SIMULATOR", &format!("... and {} more accounts", sorted_accounts.len() - 10));
-        }
-        
-        // Check chain-2 account balances
-        let chain_2_state = hig_node_2.lock().await.get_chain_state().await.unwrap();
-        logging::log("SIMULATOR", &format!("Chain-2 state: {} accounts with balances", chain_2_state.len()));
-        
-        // Log first few account balances as examples
-        let mut sorted_accounts: Vec<_> = chain_2_state.iter().collect();
-        sorted_accounts.sort_by_key(|(account_id, _)| account_id.parse::<u32>().unwrap_or(0));
-        
-        for (account_id, balance) in sorted_accounts.iter().take(10) {
-            logging::log("SIMULATOR", &format!("Chain-2 Account {}: {} tokens", account_id, balance));
-        }
-        if sorted_accounts.len() > 10 {
-            logging::log("SIMULATOR", &format!("... and {} more accounts", sorted_accounts.len() - 10));
-        }
-        
-        logging::log("SIMULATOR", "=== Account Balance Verification Complete ===");
-        
-        // Now set the actual chain delays for the main simulation
-        logging::log("SIMULATOR", "Setting actual chain delays for main simulation...");
-        let delay_1_time = Duration::from_secs_f64(config.network_config.block_interval * config.network_config.chain_delays[0] as f64);
-        let delay_2_time = Duration::from_secs_f64(config.network_config.block_interval * config.network_config.chain_delays[1] as f64);
-        hig_node_1.lock().await.set_hs_message_delay(delay_1_time);
-        hig_node_2.lock().await.set_hs_message_delay(delay_2_time);
-        logging::log("SIMULATOR", &format!("Set chain 1 delay to {} blocks ({:?}) and chain 2 delay to {} blocks ({:?})", 
-            config.network_config.chain_delays[0], delay_1_time, config.network_config.chain_delays[1], delay_2_time));
+        nodes.log_preloaded_balances().await;
 
-        // Run simulation
+        // Run simulation (it applies the configured chain delays itself)
         let run_message = format!("Run {}/{}", run, num_runs);
         let simulation_result = crate::run_simulation::run_simulation_with_message_and_retries(
-            cl_node.clone(),
-            vec![hig_node_1.clone(), hig_node_2.clone()],
+            nodes.cl_node.clone(),
+            nodes.hig_nodes.clone(),
             &mut results,
             Some(run_message),
             None, // No retry count needed
         ).await;
+        crate::run_simulation::collect_hs_message_counts(&nodes.hs_node, &mut results).await;
 
         // Check if simulation failed
         if let Err(e) = simulation_result {
@@ -167,17 +124,7 @@ pub async fn run_simple_simulation() -> Result<(), crate::config::ConfigError> {
         // Shutdown nodes between runs to prevent memory leak
         if run < num_runs {
             logging::log("SIMULATOR", "Shutting down nodes between runs to clear state...");
-            
-            // Shutdown HIG nodes
-            hyperplane::hyper_ig::node::HyperIGNode::shutdown(hig_node_1.clone()).await;
-            hyperplane::hyper_ig::node::HyperIGNode::shutdown(hig_node_2.clone()).await;
-            
-            // Shutdown CL node
-            hyperplane::confirmation_layer::node::ConfirmationLayerNode::shutdown(cl_node.clone()).await;
-            
-            // Shutdown HS node
-            hyperplane::hyper_scheduler::node::HyperSchedulerNode::shutdown(hs_node.clone()).await;
-            
+            nodes.shutdown().await;
             logging::log("SIMULATOR", "Node shutdown complete");
         }
 
@@ -276,6 +223,7 @@ fn initialize_simulation_results(config: &crate::config::Config) -> crate::Simul
     results.cat_lifetime = config.transaction_config.cat_lifetime_blocks;
     results.initialization_wait_blocks = config.simulation_config.initialization_wait_blocks;
     results.chain_delays = config.network_config.chain_delays.clone();
+    results.cat_span = config.transaction_config.cat_span;
     results.start_time = Instant::now();
 
     // Log configuration

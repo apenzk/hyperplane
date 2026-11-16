@@ -85,6 +85,23 @@ struct HyperIGState {
     latency_regular_tx_finalized: f64, // Average latency in milliseconds
     max_latency_regular_tx_finalized: f64, // Maximum latency in milliseconds
     count_regular_tx_finalized: u64,   // Number of finalized regular transactions
+    /// One record per CAT that reached a final status on this chain
+    cat_latency_records: Vec<CATLatencyRecord>,
+}
+
+/// Finality record of one CAT on one chain, used by the simulator to measure CAT latency
+#[derive(Debug, Clone)]
+pub struct CATLatencyRecord {
+    /// The CAT identifier
+    pub cat_id: CATId,
+    /// Block height at which the CAT was first seen by this chain
+    pub start_block: u64,
+    /// Block height at which the CAT reached its final status on this chain
+    pub final_block: u64,
+    /// Wall-clock time from first seen to final status, in milliseconds
+    pub latency_ms: f64,
+    /// Whether the CAT finalized as Success
+    pub success: bool,
 }
 
 impl HyperIGState {
@@ -198,6 +215,7 @@ impl HyperIGState {
         if status != TransactionStatus::Failure && status != TransactionStatus::Success {
             panic!("BUG: Transaction {} is not being updated to a final status", tx_id.0);
         }
+        let is_success = status == TransactionStatus::Success;
         // Update the transaction status first
         self.transaction_statuses.insert(tx_id.clone(), status);
         
@@ -215,7 +233,21 @@ impl HyperIGState {
             // Check if this is a regular transaction (not a CAT)
             // A transaction is a CAT if it exists as a value in cat_to_tx_id
             let is_cat = self.cat_to_tx_id.values().any(|cat_tx_id| cat_tx_id == tx_id);
-            if !is_cat {
+            if is_cat {
+                // Record per-CAT finality on this chain
+                if let Some(cat_id) = self.tx_to_cat_id.get(tx_id).cloned() {
+                    let start_block = self.cat_max_lifetime.get(&cat_id)
+                        .map(|max| max.saturating_sub(self.cat_lifetime))
+                        .unwrap_or(self.current_block_height);
+                    self.cat_latency_records.push(CATLatencyRecord {
+                        cat_id,
+                        start_block,
+                        final_block: self.current_block_height,
+                        latency_ms: start_time.elapsed().as_millis() as f64,
+                        success: is_success,
+                    });
+                }
+            } else {
                 let latency_ms = start_time.elapsed().as_millis() as f64;
                 let n = self.count_regular_tx_finalized;
                 // Update running average: new_avg = (old_avg * n + new_value) / (n + 1)
@@ -330,6 +362,7 @@ impl HyperIGNode {
                 latency_regular_tx_finalized: 0.0,
                 max_latency_regular_tx_finalized: 0.0,
                 count_regular_tx_finalized: 0,
+                cat_latency_records: Vec::new(),
             })),
             receiver_cl_to_hig: Some(receiver_cl_to_hig),
             sender_hig_to_hs: Some(sender_hig_to_hs),
@@ -527,6 +560,7 @@ impl HyperIGNode {
             state.tx_depends_on_keys.clear();
             state.pending_proposals.clear();
             state.cat_max_lifetime.clear();
+            state.cat_latency_records.clear();
             state.current_block_height = 0;
             
             // Reset CAT counters
@@ -1416,6 +1450,14 @@ impl HyperIGNode {
     /// The number of regular transactions that have been finalized
     pub async fn get_regular_tx_finalized_count(&self) -> u64 {
         self.state.lock().await.count_regular_tx_finalized
+    }
+
+    /// Gets the finality records of all CATs that reached a final status on this chain.
+    ///
+    /// # Returns
+    /// One record per finalized CAT, in finalization order
+    pub async fn get_cat_latency_records(&self) -> Vec<CATLatencyRecord> {
+        self.state.lock().await.cat_latency_records.clone()
     }
 
 

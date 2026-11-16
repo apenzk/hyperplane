@@ -84,6 +84,30 @@ pub struct TransactionConfig {
     pub cat_lifetime_blocks: u64,
     /// Whether CATs can depend on locked keys from pending transactions (affects transaction ordering)
     pub allow_cat_pending_dependencies: bool,
+    /// Which chains each CAT touches (all chains, or a uniformly random pair)
+    #[serde(default)]
+    pub cat_span: CatSpan,
+}
+
+/// Which chains a CAT touches.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CatSpan {
+    /// Every CAT spans all configured chains
+    #[default]
+    AllChains,
+    /// Every CAT spans a uniformly random pair of distinct chains
+    TwoChains,
+}
+
+impl CatSpan {
+    /// Short label used in result paths and JSON output
+    pub fn label(&self) -> &'static str {
+        match self {
+            CatSpan::AllChains => "all_chains",
+            CatSpan::TwoChains => "two_chains",
+        }
+    }
 }
 
 /// Configuration for logging and output control.
@@ -269,6 +293,9 @@ pub fn validate_common_fields(
     }
     if network_config.chain_delays.len() != network_config.num_chains {
         return Err(ConfigError::ValidationError("Number of chain delays must match number of chains".into()));
+    }
+    if network_config.num_chains < 2 && transaction_config.ratio_cats > 0.0 {
+        return Err(ConfigError::ValidationError("CATs need at least two chains".into()));
     }
     // No validation needed for u64 - it's always non-negative
     if network_config.block_interval <= 0.0 {

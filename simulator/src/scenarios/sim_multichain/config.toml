@@ -1,0 +1,32 @@
+# Multi-chain comparison: number of chains N x CAT span.
+# The runner (simulator/src/bin/multichain.rs) overrides num_chains, chain_delays and cat_span per cell.
+
+[network_config]
+# Base value; the runner sets num_chains to each entry of --chains
+num_chains = 2
+# Base value; the runner sets every chain's delay to base_chain_delay below
+chain_delays = [0.0, 0.0]
+block_interval = 1.0
+channel_buffer_size = 1000
+
+[account_config]
+initial_balance = 9999
+num_accounts = 10000
+
+[transaction_config]
+# Transactions issued per block. Regular txs are mirrored to every chain, so each chain sees all of them.
+target_tpb = 100.0
+zipf_parameter = 0.8
+ratio_cats = 0.5
+cat_lifetime_blocks = 10
+allow_cat_pending_dependencies = true
+# Base value; the runner sets it to each entry of --spans
+cat_span = "all_chains"
+
+[simulation_config]
+initialization_wait_blocks = 10
+num_runs = 3
+sim_total_block_number = 100
+
+[logging_config]
+log_to_file = false

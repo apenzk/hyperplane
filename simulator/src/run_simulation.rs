@@ -9,6 +9,7 @@ use tokio::time::sleep;
 use indicatif::{ProgressBar, ProgressStyle};
 use hyperplane::{
     types::{TransactionId, Transaction, CLTransaction, CLTransactionId, ChainId},
+    hyper_scheduler::node::HyperSchedulerNode,
     confirmation_layer::{ConfirmationLayerNode, ConfirmationLayer},
     hyper_ig::node::HyperIGNode,
     hyper_ig::HyperIG,
@@ -17,6 +18,9 @@ use hyperplane::{
 use crate::zipf_account_selection::AccountSelector;
 use rand::Rng;
 use crate::SimulationResults;
+use crate::simulation_results::{ChainSeries, IssuedCAT};
+use crate::config::CatSpan;
+use rand::seq::index::sample;
 use std::time::Instant;
 
 // ------------------------------------------------------------------------------------------------
@@ -138,13 +142,17 @@ pub async fn run_simulation_with_message_and_retries(
         logging::log("SIMULATOR", &format!("Set chain {} delay to {} blocks ({:?})", i + 1, delay_blocks, delay_time));
     }
     
-    // Track transaction amounts per chain by height. In the chain the tx is either pending, success, or failure.
     let mut current_block = initial_block;
     
-    // Get registered chains
+    // Registered chains, in registration order (chain-1 .. chain-N)
     let chains = cl_node.lock().await.get_registered_chains().await.map_err(|e| e.to_string())?;
-    let chain_id_1 = chains[0].clone();
-    let chain_id_2 = chains[1].clone();
+    if chains.len() != hig_nodes.len() {
+        return Err(format!("{} chains registered but {} HIG nodes given", chains.len(), hig_nodes.len()));
+    }
+    if chains.len() < 2 && results.ratio_cats > 0.0 {
+        return Err("CATs need at least two chains".to_string());
+    }
+    results.chains = vec![ChainSeries::default(); chains.len()];
     
     // ------- main simulation loop -------
 
@@ -185,14 +193,7 @@ pub async fn run_simulation_with_message_and_retries(
             logging::log("SIMULATOR", &format!("🎯 NEW BLOCK CREATED - Height: {} 🎯", new_block));
             
             // Process and record all data for this height
-            process_block_data(
-                &cl_node,
-                &hig_nodes,
-                results,
-                new_block,
-                chain_id_1.clone(),
-                chain_id_2.clone(),
-            ).await?;
+            process_block_data(&cl_node, &hig_nodes, &chains, results, new_block).await?;
             
             current_block = new_block;
             
@@ -207,8 +208,7 @@ pub async fn run_simulation_with_message_and_retries(
                 &mut account_selector_sender,
                 &mut account_selector_receiver,
                 results,
-                chain_id_1.clone(),
-                chain_id_2.clone(),
+                &chains,
                 transactions_per_block,
                 new_block,
                 height_delta,
@@ -222,154 +222,95 @@ pub async fn run_simulation_with_message_and_retries(
             tokio::time::sleep(wait_interval).await;
         }
     }
- 
-    // Save results - removed for sweep simulations that handle their own saving
-    // results.save().await?;
+
+    results.final_block = current_block;
+    collect_cat_latency_records(&hig_nodes, results).await;
     
     Ok(())
+}
+
+/// Copies the per-chain CAT finality records from the HIG nodes into the results
+pub async fn collect_cat_latency_records(hig_nodes: &[Arc<Mutex<HyperIGNode>>], results: &mut SimulationResults) {
+    for (chain, hig_node) in results.chains.iter_mut().zip(hig_nodes) {
+        chain.cat_latency_records = hig_node.lock().await.get_cat_latency_records().await;
+    }
+}
+
+/// Copies the hyper scheduler message counters into the results
+pub async fn collect_hs_message_counts(hs_node: &Arc<Mutex<HyperSchedulerNode>>, results: &mut SimulationResults) {
+    let hs = hs_node.lock().await;
+    results.hs_message_counts = hs.get_message_counts().await;
+    let mut per_cat: Vec<(String, _)> = hs.get_per_cat_message_counts().await.into_iter().map(|(id, c)| (id.0.0, c)).collect();
+    per_cat.sort_by(|a, b| a.0.cmp(&b.0));
+    results.hs_per_cat_message_counts = per_cat;
 }
 
 // ------------------------------------------------------------------------------------------------
 // Data Processing Functions
 // ------------------------------------------------------------------------------------------------
 
+/// Counts the user transactions of one chain in one block, excluding HS status updates
+async fn count_user_txs(cl_node: &Arc<Mutex<ConfirmationLayerNode>>, chain_id: &ChainId, block_height: u64) -> (u64, u64) {
+    cl_node.lock().await.get_subblock(chain_id.clone(), block_height).await
+        .map(|subblock| {
+            let total = subblock.transactions.len() as u64;
+            let user = subblock.transactions.iter().filter(|tx| !tx.data.starts_with("STATUS_UPDATE")).count() as u64;
+            (user, total)
+        })
+        .unwrap_or((0, 0))
+}
+
 /// Processes and records all data for a single block
 async fn process_block_data(
     cl_node: &Arc<Mutex<ConfirmationLayerNode>>,
     hig_nodes: &[Arc<Mutex<HyperIGNode>>],
+    chains: &[ChainId],
     results: &mut SimulationResults,
     block_height: u64,
-    chain_id_1: ChainId,
-    chain_id_2: ChainId,
 ) -> Result<(), String> {
-    // Get CAT transaction status counts
-    let (chain_1_cat_pending, chain_1_cat_success, chain_1_cat_failure) = hig_nodes[0].lock().await.get_transaction_status_counts_cats().await.map_err(|e| e.to_string())?;
-    let (chain_2_cat_pending, chain_2_cat_success, chain_2_cat_failure) = hig_nodes[1].lock().await.get_transaction_status_counts_cats().await.map_err(|e| e.to_string())?;
-    
-    // Get detailed CAT pending state counts
-    let (chain_1_cat_pending_resolving, chain_1_cat_pending_postponed) = hig_nodes[0].lock().await.get_cat_pending_detailed_counts().await.map_err(|e| e.to_string())?;
-    let (chain_2_cat_pending_resolving, chain_2_cat_pending_postponed) = hig_nodes[1].lock().await.get_cat_pending_detailed_counts().await.map_err(|e| e.to_string())?;
-    
-    // Get regular transaction status counts
-    let (chain_1_regular_pending, chain_1_regular_success, chain_1_regular_failure) = hig_nodes[0].lock().await.get_transaction_status_counts_regular().await.map_err(|e| e.to_string())?;
-    let (chain_2_regular_pending, chain_2_regular_success, chain_2_regular_failure) = hig_nodes[1].lock().await.get_transaction_status_counts_regular().await.map_err(|e| e.to_string())?;
-    
-    // Get locked keys counts
-    let chain_1_locked_keys = hig_nodes[0].lock().await.get_total_locked_keys_count().await;
-    let chain_2_locked_keys = hig_nodes[1].lock().await.get_total_locked_keys_count().await;
-    
-    // Calculate combined totals for backward compatibility
-    let chain_1_pending = chain_1_cat_pending + chain_1_regular_pending;
-    let chain_1_success = chain_1_cat_success + chain_1_regular_success;
-    let chain_1_failure = chain_1_cat_failure + chain_1_regular_failure;
-    let chain_2_pending = chain_2_cat_pending + chain_2_regular_pending;
-    let chain_2_success = chain_2_cat_success + chain_2_regular_success;
-    let chain_2_failure = chain_2_cat_failure + chain_2_regular_failure;
-    
-    // Subtract initialization transactions from success counts
     // Each account gets one initialization credit transaction per chain
     let init_tx_count = results.num_accounts as u64;
-    let chain_1_success_filtered = chain_1_success.saturating_sub(init_tx_count);
-    let chain_2_success_filtered = chain_2_success.saturating_sub(init_tx_count);
-    
-    // Get transactions per block for current block (only once per block)
-    // Filter out status update transactions as they are internal system messages, not user transactions
-    let chain_1_tx_per_block = cl_node.lock().await.get_subblock(chain_id_1.clone(), block_height).await
-        .map(|subblock| {
-            subblock.transactions.iter()
-                .filter(|tx| !tx.data.starts_with("STATUS_UPDATE"))
-                .count() as u64
-        })
-        .unwrap_or(0);
-    let chain_2_tx_per_block = cl_node.lock().await.get_subblock(chain_id_2.clone(), block_height).await
-        .map(|subblock| {
-            subblock.transactions.iter()
-                .filter(|tx| !tx.data.starts_with("STATUS_UPDATE"))
-                .count() as u64
-        })
-        .unwrap_or(0);
-    
-    // Record combined totals (for backward compatibility)
-    results.chain_1_pending.push((block_height, chain_1_pending));    
-    results.chain_2_pending.push((block_height, chain_2_pending));
-    results.chain_1_success.push((block_height, chain_1_success_filtered));
-    results.chain_2_success.push((block_height, chain_2_success_filtered));
-    results.chain_1_failure.push((block_height, chain_1_failure));
-    results.chain_2_failure.push((block_height, chain_2_failure));
-    
-    // Record CAT transaction data
-    results.chain_1_cat_pending.push((block_height, chain_1_cat_pending));
-    results.chain_2_cat_pending.push((block_height, chain_2_cat_pending));
-    results.chain_1_cat_success.push((block_height, chain_1_cat_success));
-    results.chain_2_cat_success.push((block_height, chain_2_cat_success));
-    results.chain_1_cat_failure.push((block_height, chain_1_cat_failure));
-    results.chain_2_cat_failure.push((block_height, chain_2_cat_failure));
-    
-    // Record detailed CAT pending state data
-    results.chain_1_cat_pending_resolving.push((block_height, chain_1_cat_pending_resolving));
-    results.chain_2_cat_pending_resolving.push((block_height, chain_2_cat_pending_resolving));
-    results.chain_1_cat_pending_postponed.push((block_height, chain_1_cat_pending_postponed));
-    results.chain_2_cat_pending_postponed.push((block_height, chain_2_cat_pending_postponed));
-    
-    // Record regular transaction data
-    results.chain_1_regular_pending.push((block_height, chain_1_regular_pending));
-    results.chain_2_regular_pending.push((block_height, chain_2_regular_pending));
-    results.chain_1_regular_success.push((block_height, chain_1_regular_success));
-    results.chain_2_regular_success.push((block_height, chain_2_regular_success));
-    results.chain_1_regular_failure.push((block_height, chain_1_regular_failure));
-    results.chain_2_regular_failure.push((block_height, chain_2_regular_failure));
-    
-    // Record locked keys data
-    results.chain_1_locked_keys.push((block_height, chain_1_locked_keys));
-    results.chain_2_locked_keys.push((block_height, chain_2_locked_keys));
-    
-    // Record transactions per block data (excluding status updates)
-    results.chain_1_tx_per_block.push((block_height, chain_1_tx_per_block));
-    results.chain_2_tx_per_block.push((block_height, chain_2_tx_per_block));
-    
-    // Record regular transaction timing metrics
-    let chain_1_avg_latency = hig_nodes[0].lock().await.get_average_regular_tx_latency().await;
-    let chain_2_avg_latency = hig_nodes[1].lock().await.get_average_regular_tx_latency().await;
-    let chain_1_max_latency = hig_nodes[0].lock().await.get_max_regular_tx_latency().await;
-    let chain_2_max_latency = hig_nodes[1].lock().await.get_max_regular_tx_latency().await;
-    let chain_1_finalized_count = hig_nodes[0].lock().await.get_regular_tx_finalized_count().await;
-    let chain_2_finalized_count = hig_nodes[1].lock().await.get_regular_tx_finalized_count().await;
-    
-    results.chain_1_regular_tx_avg_latency.push((block_height, chain_1_avg_latency));
-    results.chain_2_regular_tx_avg_latency.push((block_height, chain_2_avg_latency));
-    results.chain_1_regular_tx_max_latency.push((block_height, chain_1_max_latency));
-    results.chain_2_regular_tx_max_latency.push((block_height, chain_2_max_latency));
-    results.chain_1_regular_tx_finalized_count.push((block_height, chain_1_finalized_count));
-    results.chain_2_regular_tx_finalized_count.push((block_height, chain_2_finalized_count));
-    
-    // Log TPB information for debugging
-    let chain_1_total = cl_node.lock().await.get_subblock(chain_id_1.clone(), block_height).await
-        .map(|subblock| subblock.transactions.len() as u64)
-        .unwrap_or(0);
-    let chain_2_total = cl_node.lock().await.get_subblock(chain_id_2.clone(), block_height).await
-        .map(|subblock| subblock.transactions.len() as u64)
-        .unwrap_or(0);
-    
-    if chain_1_total != chain_1_tx_per_block || chain_2_total != chain_2_tx_per_block {
-        logging::log("SIMULATOR", &format!("Block {}: Chain-1 TPB: {} (filtered from {} total), Chain-2 TPB: {} (filtered from {} total)", 
-            block_height, chain_1_tx_per_block, chain_1_total, chain_2_tx_per_block, chain_2_total));
+
+    for (index, (hig_node, chain_id)) in hig_nodes.iter().zip(chains).enumerate() {
+        let hig = hig_node.lock().await;
+        let (cat_pending, cat_success, cat_failure) = hig.get_transaction_status_counts_cats().await.map_err(|e| e.to_string())?;
+        let (cat_pending_resolving, cat_pending_postponed) = hig.get_cat_pending_detailed_counts().await.map_err(|e| e.to_string())?;
+        let (regular_pending, regular_success, regular_failure) = hig.get_transaction_status_counts_regular().await.map_err(|e| e.to_string())?;
+        let locked_keys = hig.get_total_locked_keys_count().await;
+        let avg_latency = hig.get_average_regular_tx_latency().await;
+        let max_latency = hig.get_max_regular_tx_latency().await;
+        let finalized_count = hig.get_regular_tx_finalized_count().await;
+        drop(hig);
+
+        let (tx_per_block, total_in_block) = count_user_txs(cl_node, chain_id, block_height).await;
+        if total_in_block != tx_per_block {
+            logging::log("SIMULATOR", &format!("Block {}: {} TPB: {} (filtered from {} total)", block_height, chain_id.0, tx_per_block, total_in_block));
+        }
+
+        let series = &mut results.chains[index];
+        series.pending.push((block_height, cat_pending + regular_pending));
+        series.success.push((block_height, (cat_success + regular_success).saturating_sub(init_tx_count)));
+        series.failure.push((block_height, cat_failure + regular_failure));
+        series.cat_pending.push((block_height, cat_pending));
+        series.cat_success.push((block_height, cat_success));
+        series.cat_failure.push((block_height, cat_failure));
+        series.cat_pending_resolving.push((block_height, cat_pending_resolving));
+        series.cat_pending_postponed.push((block_height, cat_pending_postponed));
+        series.regular_pending.push((block_height, regular_pending));
+        series.regular_success.push((block_height, regular_success));
+        series.regular_failure.push((block_height, regular_failure));
+        series.locked_keys.push((block_height, locked_keys));
+        series.tx_per_block.push((block_height, tx_per_block));
+        series.regular_tx_avg_latency.push((block_height, avg_latency));
+        series.regular_tx_max_latency.push((block_height, max_latency));
+        series.regular_tx_finalized_count.push((block_height, finalized_count));
     }
     
-    // Record memory usage for this block
-    let memory_usage = crate::SimulationResults::get_current_memory_usage();
-    results.memory_usage.push((block_height, memory_usage));
-    
-    // Record total RAM usage for this block
-            let total_memory = crate::SimulationResults::get_current_total_memory();
-        results.total_memory.push((block_height, total_memory));
-    
-    // Record process CPU usage for this block
-    let cpu_usage = crate::SimulationResults::get_current_cpu_usage();
-    results.cpu_usage.push((block_height, cpu_usage));
-    
-    // Record total system CPU usage for this block
-    let total_cpu_usage = crate::SimulationResults::get_current_total_cpu_usage();
-    results.total_cpu_usage.push((block_height, total_cpu_usage));
+    // Record system metrics for this block
+    results.memory_usage.push((block_height, crate::SimulationResults::get_current_memory_usage()));
+    results.total_memory.push((block_height, crate::SimulationResults::get_current_total_memory()));
+    results.cpu_usage.push((block_height, crate::SimulationResults::get_current_cpu_usage()));
+    results.total_cpu_usage.push((block_height, crate::SimulationResults::get_current_total_cpu_usage()));
     
     // Record CL queue length for this block
     let cl_queue_length = cl_node.lock().await.get_pending_transactions().await
@@ -383,6 +324,18 @@ async fn process_block_data(
 // Transaction Release Functions
 // ------------------------------------------------------------------------------------------------
 
+/// Picks the chains a CAT touches, as indices into `chains`, sorted ascending
+fn select_cat_chains(rng: &mut rand::rngs::ThreadRng, num_chains: usize, cat_span: CatSpan) -> Vec<usize> {
+    match cat_span {
+        CatSpan::AllChains => (0..num_chains).collect(),
+        CatSpan::TwoChains => {
+            let mut pair = sample(rng, num_chains, 2).into_vec();
+            pair.sort_unstable();
+            pair
+        }
+    }
+}
+
 /// Releases all transactions for a single block
 async fn release_transactions_for_block(
     cl_node: &Arc<Mutex<ConfirmationLayerNode>>,
@@ -390,10 +343,9 @@ async fn release_transactions_for_block(
     account_selector_sender: &mut AccountSelector,
     account_selector_receiver: &mut AccountSelector,
     results: &mut SimulationResults,
-    chain_id_1: ChainId,
-    chain_id_2: ChainId,
+    chains: &[ChainId],
     transactions_per_block: u64,
-    _current_block: u64,
+    current_block: u64,
     height_delta: u64,
 ) -> Result<(), String> {
     // Calculate total transactions to send (compensate for missed blocks)
@@ -426,24 +378,16 @@ async fn release_transactions_for_block(
             results.transactions_sent
         ));
         
-        let (success, _) = if is_cat {
+        let success = if is_cat {
             results.cat_transactions += 1;
-            create_and_submit_cat_transaction(
-                cl_node,
-                cl_id,
-                chain_id_1.clone(),
-                chain_id_2.clone(),
-                tx_data.clone(),
-            ).await?
+            let indices = select_cat_chains(rng, chains.len(), results.cat_span);
+            let cat_chains: Vec<ChainId> = indices.iter().map(|&i| chains[i].clone()).collect();
+            let submitted = create_and_submit_cat_transaction(cl_node, cl_id.clone(), &cat_chains, tx_data.clone()).await?;
+            results.cats_issued.push(IssuedCAT { cat_id: cl_id.0.clone(), block: current_block, chains: indices.iter().map(|i| i + 1).collect() });
+            submitted
         } else {
             results.regular_transactions += 1;
-            create_and_submit_regular_transaction(
-                cl_node,
-                cl_id,
-                chain_id_1.clone(),
-                chain_id_2.clone(),
-                tx_data.clone(),
-            ).await?
+            create_and_submit_regular_transaction(cl_node, cl_id, chains, tx_data.clone()).await?
         };
 
         if success {
@@ -463,156 +407,100 @@ async fn release_transactions_for_block(
 // Transaction Creation and Submission
 // ------------------------------------------------------------------------------------------------
 
-/// Creates and submits a CAT transaction
-/// 
+/// Creates and submits a CAT transaction with one sub-transaction per chain in `cat_chains`
+///
 /// # Arguments
 ///
 /// * `cl_node` - A reference to the confirmation layer node
 /// * `cl_id` - A CLTransactionId, the ID of the CL transaction
-/// * `chain_id_1` - A ChainId, the ID of the first chain
-/// * `chain_id_2` - A ChainId, the ID of the second chain
+/// * `cat_chains` - The chains the CAT touches (at least two)
 /// * `tx_data` - A String, the data of the transaction
+///
+/// # Returns
+///
+/// Whether the CL accepted the transaction
 async fn create_and_submit_cat_transaction(
     cl_node: &Arc<Mutex<ConfirmationLayerNode>>,
     cl_id: CLTransactionId,
-    chain_id_1: ChainId,
-    chain_id_2: ChainId,
+    cat_chains: &[ChainId],
     tx_data: String,
-) -> Result<(bool, String), String> {
-    // Create transactions for both chains
-    let tx1 = Transaction::new(
-        TransactionId(format!("{:?}:tx1", cl_id)),
-        chain_id_1.clone(),
-        vec![chain_id_1.clone(), chain_id_2.clone()],
-        tx_data.clone(),
-        cl_id.clone(),
-    ).map_err(|e| {
-        logging::log("SIMULATOR", &format!("Failed to create CAT-sub-transaction 1: {}", e));
-        e.to_string()
-    })?;
+) -> Result<bool, String> {
+    let mut sub_txs = Vec::with_capacity(cat_chains.len());
+    for (i, chain_id) in cat_chains.iter().enumerate() {
+        let tx = Transaction::new(
+            TransactionId(format!("{:?}:tx{}", cl_id, i + 1)),
+            chain_id.clone(),
+            cat_chains.to_vec(),
+            tx_data.clone(),
+            cl_id.clone(),
+        ).map_err(|e| {
+            logging::log("SIMULATOR", &format!("Failed to create CAT-sub-transaction {}: {}", i + 1, e));
+            e.to_string()
+        })?;
+        sub_txs.push(tx);
+    }
 
-    let tx2 = Transaction::new(
-        TransactionId(format!("{:?}:tx2", cl_id)),
-        chain_id_2.clone(),
-        vec![chain_id_1.clone(), chain_id_2.clone()],
-        tx_data.clone(),
-        cl_id.clone(),
-    ).map_err(|e| {
-        logging::log("SIMULATOR", &format!("Failed to create CAT-sub-transaction 2: {}", e));
-        e.to_string()
-    })?;
-
-    // Create the CL transaction
-    let cl_tx = CLTransaction::new(
-        cl_id.clone(),
-        vec![chain_id_1.clone(), chain_id_2.clone()],
-        vec![tx1, tx2],
-    ).map_err(|e| {
+    let cl_tx = CLTransaction::new(cl_id.clone(), cat_chains.to_vec(), sub_txs).map_err(|e| {
         logging::log("SIMULATOR", &format!("Failed to create CAT CL transaction: {}", e));
         e.to_string()
     })?;
 
     logging::log("SIMULATOR", &format!("Created CAT CL transaction with ID: {:?}", cl_id));
 
-    // Submit transaction to CL node
-    match cl_node.lock().await.submit_transaction(cl_tx.clone()).await {
+    match cl_node.lock().await.submit_transaction(cl_tx).await {
         Ok(_) => {
             logging::log("SIMULATOR", &format!("CAT transaction submitted successfully: {}", tx_data));
-            Ok((true, tx_data))
+            Ok(true)
         }
         Err(e) => {
             logging::log("SIMULATOR", &format!("Failed to submit CAT CL transaction: {}", e));
-            logging::log("SIMULATOR", &format!("CAT transaction failed: {}", tx_data));
-            Ok((false, tx_data))
+            Ok(false)
         }
     }
 }
 
-/// Creates and submits a regular transaction
+/// Creates and submits a regular transaction, mirrored to every chain as its own CL transaction
 ///
 /// # Arguments
 ///
 /// * `cl_node` - A reference to the confirmation layer node
-/// * `cl_id` - A CLTransactionId, the ID of the CL transaction
-/// * `chain_id_1` - A ChainId, the ID of the first chain
-/// * `chain_id_2` - A ChainId, the ID of the second chain
+/// * `cl_id` - A CLTransactionId, the base ID of the CL transactions
+/// * `chains` - All chains; each gets one copy of the transaction
+/// * `tx_data` - A String, the data of the transaction
+///
+/// # Returns
+///
+/// Whether the CL accepted every copy
 async fn create_and_submit_regular_transaction(
     cl_node: &Arc<Mutex<ConfirmationLayerNode>>,
     cl_id: CLTransactionId,
-    chain_id_1: ChainId,
-    chain_id_2: ChainId,
+    chains: &[ChainId],
     tx_data: String,
-) -> Result<(bool, String), String> {
-    // Create and submit CL transaction for chain-1
-    let cl_id_1 = CLTransactionId(format!("{:?}_1", cl_id));
-    let tx_1 = Transaction::new(
-        TransactionId(format!("{:?}_1:tx", cl_id.clone())),
-        chain_id_1.clone(),
-        vec![chain_id_1.clone()],
-        tx_data.clone(),
-        cl_id_1.clone(),
-    ).map_err(|e| {
-        logging::log("SIMULATOR", &format!("Failed to create regular transaction for chain-1: {}", e));
-        e.to_string()
-    })?;
-
-    let cl_tx_1 = CLTransaction::new(
-        cl_id_1.clone(),
-        vec![chain_id_1.clone()],
-        vec![tx_1],
-    ).map_err(|e| {
-        logging::log("SIMULATOR", &format!("Failed to create regular CL transaction for chain-1: {}", e));
-        e.to_string()
-    })?;
-
-    // Create and submit CL transaction for chain-2
-    let cl_id_2 = CLTransactionId(format!("{:?}_2", cl_id));
-    let tx_2 = Transaction::new(
-        TransactionId(format!("{:?}:tx", cl_id_2.clone())),
-        chain_id_2.clone(),
-        vec![chain_id_2.clone()],
-        tx_data.clone(),
-        cl_id_2.clone(),
-    ).map_err(|e| {
-        logging::log("SIMULATOR", &format!("Failed to create regular transaction for chain-2: {}", e));
-        e.to_string()
-    })?;
-
-    let cl_tx_2 = CLTransaction::new(
-        cl_id_2.clone(),
-        vec![chain_id_2.clone()],
-        vec![tx_2],
-    ).map_err(|e| {
-        logging::log("SIMULATOR", &format!("Failed to create regular CL transaction for chain-2: {}", e));
-        e.to_string()
-    })?;
-
-    logging::log("SIMULATOR", &format!("Created regular CL transactions with IDs: {:?}_1 and {:?}_2", cl_id, cl_id));
-
-    // Submit both transactions to CL node
-    let success1 = match cl_node.lock().await.submit_transaction(cl_tx_1.clone()).await {
-        Ok(_) => {
-            logging::log("SIMULATOR", &format!("Regular transaction submitted successfully to chain-1: {}", tx_data));
-            true
+) -> Result<bool, String> {
+    let mut all_submitted = true;
+    for (i, chain_id) in chains.iter().enumerate() {
+        let cl_id_i = CLTransactionId(format!("{:?}_{}", cl_id, i + 1));
+        let tx = Transaction::new(
+            TransactionId(format!("{:?}:tx", cl_id_i)),
+            chain_id.clone(),
+            vec![chain_id.clone()],
+            tx_data.clone(),
+            cl_id_i.clone(),
+        ).map_err(|e| {
+            logging::log("SIMULATOR", &format!("Failed to create regular transaction for {}: {}", chain_id.0, e));
+            e.to_string()
+        })?;
+        let cl_tx = CLTransaction::new(cl_id_i, vec![chain_id.clone()], vec![tx]).map_err(|e| {
+            logging::log("SIMULATOR", &format!("Failed to create regular CL transaction for {}: {}", chain_id.0, e));
+            e.to_string()
+        })?;
+        match cl_node.lock().await.submit_transaction(cl_tx).await {
+            Ok(_) => logging::log("SIMULATOR", &format!("Regular transaction submitted successfully to {}: {}", chain_id.0, tx_data)),
+            Err(e) => {
+                logging::log("SIMULATOR", &format!("Failed to submit regular transaction to {}: {}", chain_id.0, e));
+                all_submitted = false;
+            }
         }
-        Err(e) => {
-            logging::log("SIMULATOR", &format!("Failed to submit regular transaction to CL node: {}", e));
-            logging::log("SIMULATOR", &format!("Regular transaction failed to submit: {}", tx_data));
-            false
-        }
-    };
-
-    let success2 = match cl_node.lock().await.submit_transaction(cl_tx_2.clone()).await {
-        Ok(_) => {
-            logging::log("SIMULATOR", &format!("Regular transaction submitted successfully: {}", tx_data));
-            true
-        }
-        Err(e) => {
-            logging::log("SIMULATOR", &format!("Failed to submit regular transaction to CL node: {}", e));
-            logging::log("SIMULATOR", &format!("Regular transaction failed to submit: {}", tx_data));
-            false
-        }
-    };
-
-    Ok((success1 && success2, tx_data))
-} 
+    }
+    Ok(all_submitted)
+}

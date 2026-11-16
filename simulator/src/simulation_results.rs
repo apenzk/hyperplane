@@ -6,6 +6,9 @@ use std::time::Instant;
 use std::fs;
 use serde_json;
 use crate::account_selection::AccountSelectionStats;
+use crate::config::CatSpan;
+use hyperplane::hyper_ig::node::CATLatencyRecord;
+use hyperplane::hyper_scheduler::node::HSMessageCounts;
 use hyperplane::utils::logging;
 use sysinfo::System;
 use std::sync::Mutex;
@@ -27,6 +30,47 @@ fn get_system() -> &'static Mutex<System> {
 // Data Structures
 // ------------------------------------------------------------------------------------------------
 
+/// Per-block time series of one chain. Every entry is (block_height, value).
+#[derive(Debug, Clone, Default)]
+pub struct ChainSeries {
+    // Combined totals (CAT + regular)
+    pub pending: Vec<(u64, u64)>,
+    pub success: Vec<(u64, u64)>,
+    pub failure: Vec<(u64, u64)>,
+    // CAT transactions
+    pub cat_pending: Vec<(u64, u64)>,
+    pub cat_success: Vec<(u64, u64)>,
+    pub cat_failure: Vec<(u64, u64)>,
+    // Detailed CAT pending states
+    pub cat_pending_resolving: Vec<(u64, u64)>,
+    pub cat_pending_postponed: Vec<(u64, u64)>,
+    // Regular transactions
+    pub regular_pending: Vec<(u64, u64)>,
+    pub regular_success: Vec<(u64, u64)>,
+    pub regular_failure: Vec<(u64, u64)>,
+    // Locked keys
+    pub locked_keys: Vec<(u64, u64)>,
+    // Transactions per block (excluding status updates)
+    pub tx_per_block: Vec<(u64, u64)>,
+    // Regular transaction timing metrics
+    pub regular_tx_avg_latency: Vec<(u64, f64)>, // average latency in ms
+    pub regular_tx_max_latency: Vec<(u64, f64)>, // max latency in ms
+    pub regular_tx_finalized_count: Vec<(u64, u64)>,
+    /// Final status record of every CAT finalized on this chain, collected at the end of the run
+    pub cat_latency_records: Vec<CATLatencyRecord>,
+}
+
+/// One CAT issued by the simulator
+#[derive(Debug, Clone)]
+pub struct IssuedCAT {
+    /// The CAT identifier (equals its CL transaction id)
+    pub cat_id: String,
+    /// Block height at which the simulator submitted it
+    pub block: u64,
+    /// The chains it touches, 1-based (1 = chain-1)
+    pub chains: Vec<usize>,
+}
+
 /// Stores all simulation results and statistics
 #[derive(Debug, Clone)]
 pub struct SimulationResults {
@@ -46,47 +90,13 @@ pub struct SimulationResults {
     pub cat_lifetime: u64,
     pub initialization_wait_blocks: u64,
     pub transaction_submission_frequency: u64,  // How many times per block to check for transaction submission
-    pub chain_delays: Vec<f64>,  // Chain delays in blocks
-    
-    // Chain data - Combined totals (for backward compatibility)
-    pub chain_1_pending: Vec<(u64, u64)>,
-    pub chain_2_pending: Vec<(u64, u64)>,
-    pub chain_1_success: Vec<(u64, u64)>,
-    pub chain_2_success: Vec<(u64, u64)>,
-    pub chain_1_failure: Vec<(u64, u64)>,
-    pub chain_2_failure: Vec<(u64, u64)>,
-    
-    // Chain data - CAT transactions
-    pub chain_1_cat_pending: Vec<(u64, u64)>,
-    pub chain_2_cat_pending: Vec<(u64, u64)>,
-    pub chain_1_cat_success: Vec<(u64, u64)>,
-    pub chain_2_cat_success: Vec<(u64, u64)>,
-    pub chain_1_cat_failure: Vec<(u64, u64)>,
-    pub chain_2_cat_failure: Vec<(u64, u64)>,
-    
-    // Chain data - Detailed CAT pending states
-    pub chain_1_cat_pending_resolving: Vec<(u64, u64)>,
-    pub chain_2_cat_pending_resolving: Vec<(u64, u64)>,
-    pub chain_1_cat_pending_postponed: Vec<(u64, u64)>,
-    pub chain_2_cat_pending_postponed: Vec<(u64, u64)>,
-    
-    // Chain data - Regular transactions
-    pub chain_1_regular_pending: Vec<(u64, u64)>,
-    pub chain_2_regular_pending: Vec<(u64, u64)>,
-    pub chain_1_regular_success: Vec<(u64, u64)>,
-    pub chain_2_regular_success: Vec<(u64, u64)>,
-    pub chain_1_regular_failure: Vec<(u64, u64)>,
-    pub chain_2_regular_failure: Vec<(u64, u64)>,
-    
-    // Chain data - Locked keys
-    pub chain_1_locked_keys: Vec<(u64, u64)>,
-    pub chain_2_locked_keys: Vec<(u64, u64)>,
-    
-    // Chain data - Transactions per block
-    pub chain_1_tx_per_block: Vec<(u64, u64)>,
-    pub chain_2_tx_per_block: Vec<(u64, u64)>,
-    
-        // Memory usage tracking
+    pub chain_delays: Vec<f64>,  // Chain delays in blocks, one entry per chain
+    pub cat_span: CatSpan,  // Which chains each CAT touches
+
+    /// Per-chain series, index 0 is chain-1
+    pub chains: Vec<ChainSeries>,
+
+    // Memory usage tracking
     pub memory_usage: Vec<(u64, u64)>, // (block_height, memory_usage_bytes)
     pub total_memory: Vec<(u64, u64)>, // (block_height, total_memory_bytes)
     
@@ -102,14 +112,15 @@ pub struct SimulationResults {
     
     // CL queue length tracking
     pub cl_queue_length: Vec<(u64, u64)>, // (block_height, queue_length)
-    
-    // Regular transaction timing metrics
-    pub chain_1_regular_tx_avg_latency: Vec<(u64, f64)>, // (block_height, average_latency_ms)
-    pub chain_2_regular_tx_avg_latency: Vec<(u64, f64)>, // (block_height, average_latency_ms)
-    pub chain_1_regular_tx_max_latency: Vec<(u64, f64)>, // (block_height, max_latency_ms)
-    pub chain_2_regular_tx_max_latency: Vec<(u64, f64)>, // (block_height, max_latency_ms)
-    pub chain_1_regular_tx_finalized_count: Vec<(u64, u64)>, // (block_height, finalized_count)
-    pub chain_2_regular_tx_finalized_count: Vec<(u64, u64)>, // (block_height, finalized_count)
+
+    /// Hyper scheduler message counters at the end of the run
+    pub hs_message_counts: HSMessageCounts,
+    /// Hyper scheduler message counters per CAT id, at the end of the run
+    pub hs_per_cat_message_counts: Vec<(String, HSMessageCounts)>,
+    /// Every CAT the simulator issued, in issue order
+    pub cats_issued: Vec<IssuedCAT>,
+    /// Last block height observed by the simulation loop
+    pub final_block: u64,
     
     // Statistics
     pub account_stats: AccountSelectionStats,
@@ -137,32 +148,8 @@ impl Default for SimulationResults {
             initialization_wait_blocks: 0,
             transaction_submission_frequency: 10,  // Default to 10 times per block
             chain_delays: Vec::new(),
-            chain_1_pending: Vec::new(),
-            chain_2_pending: Vec::new(),
-            chain_1_success: Vec::new(),
-            chain_2_success: Vec::new(),
-            chain_1_failure: Vec::new(),
-            chain_2_failure: Vec::new(),
-            chain_1_cat_pending: Vec::new(),
-            chain_2_cat_pending: Vec::new(),
-            chain_1_cat_success: Vec::new(),
-            chain_2_cat_success: Vec::new(),
-            chain_1_cat_failure: Vec::new(),
-            chain_2_cat_failure: Vec::new(),
-            chain_1_cat_pending_resolving: Vec::new(),
-            chain_2_cat_pending_resolving: Vec::new(),
-            chain_1_cat_pending_postponed: Vec::new(),
-            chain_2_cat_pending_postponed: Vec::new(),
-            chain_1_regular_pending: Vec::new(),
-            chain_2_regular_pending: Vec::new(),
-            chain_1_regular_success: Vec::new(),
-            chain_2_regular_success: Vec::new(),
-            chain_1_regular_failure: Vec::new(),
-            chain_2_regular_failure: Vec::new(),
-            chain_1_locked_keys: Vec::new(),
-            chain_2_locked_keys: Vec::new(),
-            chain_1_tx_per_block: Vec::new(),
-            chain_2_tx_per_block: Vec::new(),
+            cat_span: CatSpan::default(),
+            chains: Vec::new(),
             memory_usage: Vec::new(),
             total_memory: Vec::new(),
             cpu_usage: Vec::new(),
@@ -170,16 +157,28 @@ impl Default for SimulationResults {
             loop_steps_without_tx_issuance: Vec::new(),
             block_height_delta: Vec::new(),
             cl_queue_length: Vec::new(),
-            chain_1_regular_tx_avg_latency: Vec::new(),
-            chain_2_regular_tx_avg_latency: Vec::new(),
-            chain_1_regular_tx_max_latency: Vec::new(),
-            chain_2_regular_tx_max_latency: Vec::new(),
-            chain_1_regular_tx_finalized_count: Vec::new(),
-            chain_2_regular_tx_finalized_count: Vec::new(),
+            hs_message_counts: HSMessageCounts::default(),
+            hs_per_cat_message_counts: Vec::new(),
+            cats_issued: Vec::new(),
+            final_block: 0,
             account_stats: AccountSelectionStats::new(),
             start_time: Instant::now(),
         }
     }
+}
+
+/// Writes one (height, value) series as `{ "<key>": [{"height": h, "<field>": v}, ...] }`
+fn write_series<V: serde::Serialize>(path: &str, key: &str, field: &str, series: &[(u64, V)]) -> Result<(), String> {
+    let entries: Vec<serde_json::Value> = series.iter().map(|(height, value)| {
+        let mut entry = serde_json::Map::new();
+        entry.insert("height".to_string(), serde_json::json!(height));
+        entry.insert(field.to_string(), serde_json::json!(value));
+        serde_json::Value::Object(entry)
+    }).collect();
+    let data = serde_json::json!({ key: entries });
+    fs::write(path, serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    logging::log("SIMULATOR", &format!("Saved {} to {}", key, path));
+    Ok(())
 }
 
 impl SimulationResults {
@@ -331,12 +330,19 @@ impl SimulationResults {
                 "zipf_parameter": self.zipf_parameter,
                 "ratio_cats": self.ratio_cats,
                 "block_interval": self.block_interval,
-                "chain_delays": self.chain_delays.clone()
+                "chain_delays": self.chain_delays.clone(),
+                "num_chains": self.chains.len(),
+                "cat_span": self.cat_span.label(),
+                "cat_lifetime": self.cat_lifetime
             },
             "results": {
                 "total_transactions": self.transactions_sent,
                 "cat_transactions": self.cat_transactions,
-                "regular_transactions": self.regular_transactions
+                "regular_transactions": self.regular_transactions,
+                "final_block": self.final_block,
+                "hs_proposals_received": self.hs_message_counts.proposals_received,
+                "hs_status_updates_sent": self.hs_message_counts.status_updates_sent,
+                "hs_status_update_subtxs_sent": self.hs_message_counts.status_update_subtxs_sent
             }
         });
 
@@ -348,354 +354,62 @@ impl SimulationResults {
         fs::write(&stats_file, serde_json::to_string_pretty(&stats).expect("Failed to serialize stats")).map_err(|e| e.to_string())?;
         logging::log("SIMULATOR", &format!("Saved simulation statistics to {}", stats_file));
 
-        // Save pending transactions data from chain 1
-        let pending_txs_chain_1 = serde_json::json!({
-            "chain_1_pending": self.chain_1_pending.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let pending_file_chain_1 = format!("{}/data/pending_transactions_chain_1.json", base_dir);
-        fs::write(&pending_file_chain_1, serde_json::to_string_pretty(&pending_txs_chain_1).expect("Failed to serialize pending transactions")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved pending transactions data to {}", pending_file_chain_1));
+        // Save the list of issued CATs (the denominator for CAT success rate and finality)
+        let issued: Vec<serde_json::Value> = self.cats_issued.iter().map(|c| serde_json::json!({
+            "cat_id": c.cat_id,
+            "block": c.block,
+            "chains": c.chains,
+        })).collect();
+        let issued_file = format!("{}/data/cats_issued.json", base_dir);
+        fs::write(&issued_file, serde_json::to_string_pretty(&serde_json::json!({ "cats_issued": issued })).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
 
-        // Save pending transactions data from chain 2
-        let pending_txs_chain_2 = serde_json::json!({
-            "chain_2_pending": self.chain_2_pending.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let pending_file_chain_2 = format!("{}/data/pending_transactions_chain_2.json", base_dir);
-        fs::write(&pending_file_chain_2, serde_json::to_string_pretty(&pending_txs_chain_2).expect("Failed to serialize pending transactions")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved pending transactions data to {}", pending_file_chain_2));
+        // Save the hyper scheduler message counts per CAT
+        let per_cat: Vec<serde_json::Value> = self.hs_per_cat_message_counts.iter().map(|(cat_id, c)| serde_json::json!({
+            "cat_id": cat_id,
+            "proposals_received": c.proposals_received,
+            "status_updates_sent": c.status_updates_sent,
+            "status_update_subtxs_sent": c.status_update_subtxs_sent,
+        })).collect();
+        let per_cat_file = format!("{}/data/hs_cat_messages.json", base_dir);
+        fs::write(&per_cat_file, serde_json::to_string_pretty(&serde_json::json!({ "hs_cat_messages": per_cat })).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
 
-        // Save success transactions data from chain 1
-        let success_txs_chain_1 = serde_json::json!({
-            "chain_1_success": self.chain_1_success.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let success_file_chain_1 = format!("{}/data/success_transactions_chain_1.json", base_dir);
-        fs::write(&success_file_chain_1, serde_json::to_string_pretty(&success_txs_chain_1).expect("Failed to serialize success transactions")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved success transactions data to {}", success_file_chain_1));
+        // Save per-chain series. File names and JSON keys follow <prefix>_chain_<i>.json / chain_<i>_<metric>.
+        for (index, chain) in self.chains.iter().enumerate() {
+            let i = index + 1;
+            let counts: [(&str, &str, &Vec<(u64, u64)>); 14] = [
+                ("pending_transactions", "pending", &chain.pending),
+                ("success_transactions", "success", &chain.success),
+                ("failure_transactions", "failure", &chain.failure),
+                ("cat_pending_transactions", "cat_pending", &chain.cat_pending),
+                ("cat_success_transactions", "cat_success", &chain.cat_success),
+                ("cat_failure_transactions", "cat_failure", &chain.cat_failure),
+                ("cat_pending_resolving_transactions", "cat_pending_resolving", &chain.cat_pending_resolving),
+                ("cat_pending_postponed_transactions", "cat_pending_postponed", &chain.cat_pending_postponed),
+                ("regular_pending_transactions", "regular_pending", &chain.regular_pending),
+                ("regular_success_transactions", "regular_success", &chain.regular_success),
+                ("regular_failure_transactions", "regular_failure", &chain.regular_failure),
+                ("locked_keys", "locked_keys", &chain.locked_keys),
+                ("tx_per_block", "tx_per_block", &chain.tx_per_block),
+                ("regular_tx_finalized_count", "regular_tx_finalized_count", &chain.regular_tx_finalized_count),
+            ];
+            for (prefix, metric, series) in counts {
+                write_series(&format!("{}/data/{}_chain_{}.json", base_dir, prefix, i), &format!("chain_{}_{}", i, metric), "count", series)?;
+            }
+            write_series(&format!("{}/data/regular_tx_avg_latency_chain_{}.json", base_dir, i), &format!("chain_{}_regular_tx_avg_latency", i), "latency", &chain.regular_tx_avg_latency)?;
+            write_series(&format!("{}/data/regular_tx_max_latency_chain_{}.json", base_dir, i), &format!("chain_{}_regular_tx_max_latency", i), "latency", &chain.regular_tx_max_latency)?;
 
-        // Save success transactions data from chain 2
-        let success_txs_chain_2 = serde_json::json!({
-            "chain_2_success": self.chain_2_success.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let success_file_chain_2 = format!("{}/data/success_transactions_chain_2.json", base_dir);
-        fs::write(&success_file_chain_2, serde_json::to_string_pretty(&success_txs_chain_2).expect("Failed to serialize success transactions")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved success transactions data to {}", success_file_chain_2));
-
-        // Save failure transactions data from chain 1
-        let failure_txs_chain_1 = serde_json::json!({
-            "chain_1_failure": self.chain_1_failure.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let failure_file_chain_1 = format!("{}/data/failure_transactions_chain_1.json", base_dir);
-        fs::write(&failure_file_chain_1, serde_json::to_string_pretty(&failure_txs_chain_1).expect("Failed to serialize failure transactions")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved failure transactions data to {}", failure_file_chain_1));
-
-        // Save failure transactions data from chain 2
-        let failure_txs_chain_2 = serde_json::json!({
-            "chain_2_failure": self.chain_2_failure.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let failure_file_chain_2 = format!("{}/data/failure_transactions_chain_2.json", base_dir);
-        fs::write(&failure_file_chain_2, serde_json::to_string_pretty(&failure_txs_chain_2).expect("Failed to serialize failure transactions")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved failure transactions data to {}", failure_file_chain_2));
-
-        // Save CAT failure transactions data from chain 1
-        let cat_failure_txs_chain_1 = serde_json::json!({
-            "chain_1_cat_failure": self.chain_1_cat_failure.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let cat_failure_file_chain_1 = format!("{}/data/cat_failure_transactions_chain_1.json", base_dir);
-        fs::write(&cat_failure_file_chain_1, serde_json::to_string_pretty(&cat_failure_txs_chain_1).expect("Failed to serialize CAT failure transactions")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved CAT failure transactions data to {}", cat_failure_file_chain_1));
-
-        // Save CAT pending transactions data from chain 1
-        let cat_pending_txs_chain_1 = serde_json::json!({
-            "chain_1_cat_pending": self.chain_1_cat_pending.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let cat_pending_file_chain_1 = format!("{}/data/cat_pending_transactions_chain_1.json", base_dir);
-        fs::write(&cat_pending_file_chain_1, serde_json::to_string_pretty(&cat_pending_txs_chain_1).expect("Failed to serialize CAT pending transactions")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved CAT pending transactions data to {}", cat_pending_file_chain_1));
-
-        // Save CAT pending transactions data from chain 2
-        let cat_pending_txs_chain_2 = serde_json::json!({
-            "chain_2_cat_pending": self.chain_2_cat_pending.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let cat_pending_file_chain_2 = format!("{}/data/cat_pending_transactions_chain_2.json", base_dir);
-        fs::write(&cat_pending_file_chain_2, serde_json::to_string_pretty(&cat_pending_txs_chain_2).expect("Failed to serialize CAT pending transactions")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved CAT pending transactions data to {}", cat_pending_file_chain_2));
-
-        // Save CAT success transactions data from chain 1
-        let cat_success_txs_chain_1 = serde_json::json!({
-            "chain_1_cat_success": self.chain_1_cat_success.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let cat_success_file_chain_1 = format!("{}/data/cat_success_transactions_chain_1.json", base_dir);
-        fs::write(&cat_success_file_chain_1, serde_json::to_string_pretty(&cat_success_txs_chain_1).expect("Failed to serialize CAT success transactions")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved CAT success transactions data to {}", cat_success_file_chain_1));
-
-        // Save CAT success transactions data from chain 2
-        let cat_success_txs_chain_2 = serde_json::json!({
-            "chain_2_cat_success": self.chain_2_cat_success.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let cat_success_file_chain_2 = format!("{}/data/cat_success_transactions_chain_2.json", base_dir);
-        fs::write(&cat_success_file_chain_2, serde_json::to_string_pretty(&cat_success_txs_chain_2).expect("Failed to serialize CAT success transactions")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved CAT success transactions data to {}", cat_success_file_chain_2));
-
-        // Save CAT failure transactions data from chain 1
-        let cat_failure_txs_chain_1 = serde_json::json!({
-            "chain_1_cat_failure": self.chain_1_cat_failure.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let cat_failure_file_chain_1 = format!("{}/data/cat_failure_transactions_chain_1.json", base_dir);
-        fs::write(&cat_failure_file_chain_1, serde_json::to_string_pretty(&cat_failure_txs_chain_1).expect("Failed to serialize CAT failure transactions")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved CAT failure transactions data to {}", cat_failure_file_chain_1));
-
-        // Save CAT failure transactions data from chain 2
-        let cat_failure_txs_chain_2 = serde_json::json!({
-            "chain_2_cat_failure": self.chain_2_cat_failure.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let cat_failure_file_chain_2 = format!("{}/data/cat_failure_transactions_chain_2.json", base_dir);
-        fs::write(&cat_failure_file_chain_2, serde_json::to_string_pretty(&cat_failure_txs_chain_2).expect("Failed to serialize CAT failure transactions")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved CAT failure transactions data to {}", cat_failure_file_chain_2));
-
-        // Save detailed CAT pending states data from chain 1
-        let cat_pending_resolving_txs_chain_1 = serde_json::json!({
-            "chain_1_cat_pending_resolving": self.chain_1_cat_pending_resolving.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let cat_pending_resolving_file_chain_1 = format!("{}/data/cat_pending_resolving_transactions_chain_1.json", base_dir);
-        fs::write(&cat_pending_resolving_file_chain_1, serde_json::to_string_pretty(&cat_pending_resolving_txs_chain_1).expect("Failed to serialize CAT pending resolving transactions")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved CAT pending resolving transactions data to {}", cat_pending_resolving_file_chain_1));
-
-        let cat_pending_postponed_txs_chain_1 = serde_json::json!({
-            "chain_1_cat_pending_postponed": self.chain_1_cat_pending_postponed.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let cat_pending_postponed_file_chain_1 = format!("{}/data/cat_pending_postponed_transactions_chain_1.json", base_dir);
-        fs::write(&cat_pending_postponed_file_chain_1, serde_json::to_string_pretty(&cat_pending_postponed_txs_chain_1).expect("Failed to serialize CAT pending postponed transactions")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved CAT pending postponed transactions data to {}", cat_pending_postponed_file_chain_1));
-
-        // Save detailed CAT pending states data from chain 2
-        let cat_pending_resolving_txs_chain_2 = serde_json::json!({
-            "chain_2_cat_pending_resolving": self.chain_2_cat_pending_resolving.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let cat_pending_resolving_file_chain_2 = format!("{}/data/cat_pending_resolving_transactions_chain_2.json", base_dir);
-        fs::write(&cat_pending_resolving_file_chain_2, serde_json::to_string_pretty(&cat_pending_resolving_txs_chain_2).expect("Failed to serialize CAT pending resolving transactions")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved CAT pending resolving transactions data to {}", cat_pending_resolving_file_chain_2));
-
-        let cat_pending_postponed_txs_chain_2 = serde_json::json!({
-            "chain_2_cat_pending_postponed": self.chain_2_cat_pending_postponed.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let cat_pending_postponed_file_chain_2 = format!("{}/data/cat_pending_postponed_transactions_chain_2.json", base_dir);
-        fs::write(&cat_pending_postponed_file_chain_2, serde_json::to_string_pretty(&cat_pending_postponed_txs_chain_2).expect("Failed to serialize CAT pending postponed transactions")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved CAT pending postponed transactions data to {}", cat_pending_postponed_file_chain_2));
-
-        // Save regular pending transactions data from chain 1
-        let regular_pending_txs_chain_1 = serde_json::json!({
-            "chain_1_regular_pending": self.chain_1_regular_pending.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let regular_pending_file_chain_1 = format!("{}/data/regular_pending_transactions_chain_1.json", base_dir);
-        fs::write(&regular_pending_file_chain_1, serde_json::to_string_pretty(&regular_pending_txs_chain_1).expect("Failed to serialize regular pending transactions")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved regular pending transactions data to {}", regular_pending_file_chain_1));
-
-        // Save regular pending transactions data from chain 2
-        let regular_pending_txs_chain_2 = serde_json::json!({
-            "chain_2_regular_pending": self.chain_2_regular_pending.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let regular_pending_file_chain_2 = format!("{}/data/regular_pending_transactions_chain_2.json", base_dir);
-        fs::write(&regular_pending_file_chain_2, serde_json::to_string_pretty(&regular_pending_txs_chain_2).expect("Failed to serialize regular pending transactions")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved regular pending transactions data to {}", regular_pending_file_chain_2));
-
-        // Save regular success transactions data from chain 1
-        let regular_success_txs_chain_1 = serde_json::json!({
-            "chain_1_regular_success": self.chain_1_regular_success.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let regular_success_file_chain_1 = format!("{}/data/regular_success_transactions_chain_1.json", base_dir);
-        fs::write(&regular_success_file_chain_1, serde_json::to_string_pretty(&regular_success_txs_chain_1).expect("Failed to serialize regular success transactions")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved regular success transactions data to {}", regular_success_file_chain_1));
-
-        // Save regular success transactions data from chain 2
-        let regular_success_txs_chain_2 = serde_json::json!({
-            "chain_2_regular_success": self.chain_2_regular_success.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let regular_success_file_chain_2 = format!("{}/data/regular_success_transactions_chain_2.json", base_dir);
-        fs::write(&regular_success_file_chain_2, serde_json::to_string_pretty(&regular_success_txs_chain_2).expect("Failed to serialize regular success transactions")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved regular success transactions data to {}", regular_success_file_chain_2));
-
-        // Save regular failure transactions data from chain 1
-        let regular_failure_txs_chain_1 = serde_json::json!({
-            "chain_1_regular_failure": self.chain_1_regular_failure.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let regular_failure_file_chain_1 = format!("{}/data/regular_failure_transactions_chain_1.json", base_dir);
-        fs::write(&regular_failure_file_chain_1, serde_json::to_string_pretty(&regular_failure_txs_chain_1).expect("Failed to serialize regular failure transactions")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved regular failure transactions data to {}", regular_failure_file_chain_1));
-
-        // Save regular failure transactions data from chain 2
-        let regular_failure_txs_chain_2 = serde_json::json!({
-            "chain_2_regular_failure": self.chain_2_regular_failure.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let regular_failure_file_chain_2 = format!("{}/data/regular_failure_transactions_chain_2.json", base_dir);
-        fs::write(&regular_failure_file_chain_2, serde_json::to_string_pretty(&regular_failure_txs_chain_2).expect("Failed to serialize regular failure transactions")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved regular failure transactions data to {}", regular_failure_file_chain_2));
-
-        // Save locked keys data from chain 1
-        let locked_keys_chain_1 = serde_json::json!({
-            "chain_1_locked_keys": self.chain_1_locked_keys.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let locked_keys_file_chain_1 = format!("{}/data/locked_keys_chain_1.json", base_dir);
-        fs::write(&locked_keys_file_chain_1, serde_json::to_string_pretty(&locked_keys_chain_1).expect("Failed to serialize locked keys")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved locked keys data to {}", locked_keys_file_chain_1));
-
-        // Save locked keys data from chain 2
-        let locked_keys_chain_2 = serde_json::json!({
-            "chain_2_locked_keys": self.chain_2_locked_keys.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let locked_keys_file_chain_2 = format!("{}/data/locked_keys_chain_2.json", base_dir);
-        fs::write(&locked_keys_file_chain_2, serde_json::to_string_pretty(&locked_keys_chain_2).expect("Failed to serialize locked keys")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved locked keys data to {}", locked_keys_file_chain_2));
-
-        // Save transactions per block data from chain 1
-        let tx_per_block_chain_1 = serde_json::json!({
-            "chain_1_tx_per_block": self.chain_1_tx_per_block.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let tx_per_block_file_chain_1 = format!("{}/data/tx_per_block_chain_1.json", base_dir);
-        fs::write(&tx_per_block_file_chain_1, serde_json::to_string_pretty(&tx_per_block_chain_1).expect("Failed to serialize transactions per block")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved transactions per block data to {}", tx_per_block_file_chain_1));
-
-        // Save transactions per block data from chain 2
-        let tx_per_block_chain_2 = serde_json::json!({
-            "chain_2_tx_per_block": self.chain_2_tx_per_block.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let tx_per_block_file_chain_2 = format!("{}/data/tx_per_block_chain_2.json", base_dir);
-        fs::write(&tx_per_block_file_chain_2, serde_json::to_string_pretty(&tx_per_block_chain_2).expect("Failed to serialize transactions per block")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved transactions per block data to {}", tx_per_block_file_chain_2));
+            // Per-CAT finality records on this chain
+            let records: Vec<serde_json::Value> = chain.cat_latency_records.iter().map(|r| serde_json::json!({
+                "cat_id": r.cat_id.0.0,
+                "start_block": r.start_block,
+                "final_block": r.final_block,
+                "latency_blocks": r.final_block.saturating_sub(r.start_block),
+                "latency_ms": r.latency_ms,
+                "success": r.success,
+            })).collect();
+            let cat_latency_file = format!("{}/data/cat_latency_chain_{}.json", base_dir, i);
+            fs::write(&cat_latency_file, serde_json::to_string_pretty(&serde_json::json!({ format!("chain_{}_cat_latency", i): records })).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        }
 
         // Save account selection data to files
         let (sender_json, receiver_json) = self.account_stats.to_json();
@@ -797,80 +511,6 @@ impl SimulationResults {
         fs::write(&cl_queue_length_file, serde_json::to_string_pretty(&cl_queue_length_data).expect("Failed to serialize CL queue length data")).map_err(|e| e.to_string())?;
         logging::log("SIMULATOR", &format!("Saved CL queue length data to {}", cl_queue_length_file));
 
-        // Save regular transaction timing metrics data from chain 1
-        let regular_tx_avg_latency_chain_1 = serde_json::json!({
-            "chain_1_regular_tx_avg_latency": self.chain_1_regular_tx_avg_latency.iter().map(|(height, latency)| {
-                serde_json::json!({
-                    "height": height,
-                    "latency": latency
-                })
-            }).collect::<Vec<_>>()
-        });
-        let regular_tx_avg_latency_file_chain_1 = format!("{}/data/regular_tx_avg_latency_chain_1.json", base_dir);
-        fs::write(&regular_tx_avg_latency_file_chain_1, serde_json::to_string_pretty(&regular_tx_avg_latency_chain_1).expect("Failed to serialize regular transaction average latency")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved regular transaction average latency data to {}", regular_tx_avg_latency_file_chain_1));
-
-        let regular_tx_max_latency_chain_1 = serde_json::json!({
-            "chain_1_regular_tx_max_latency": self.chain_1_regular_tx_max_latency.iter().map(|(height, latency)| {
-                serde_json::json!({
-                    "height": height,
-                    "latency": latency
-                })
-            }).collect::<Vec<_>>()
-        });
-        let regular_tx_max_latency_file_chain_1 = format!("{}/data/regular_tx_max_latency_chain_1.json", base_dir);
-        fs::write(&regular_tx_max_latency_file_chain_1, serde_json::to_string_pretty(&regular_tx_max_latency_chain_1).expect("Failed to serialize regular transaction max latency")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved regular transaction max latency data to {}", regular_tx_max_latency_file_chain_1));
-
-        let regular_tx_finalized_count_chain_1 = serde_json::json!({
-            "chain_1_regular_tx_finalized_count": self.chain_1_regular_tx_finalized_count.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let regular_tx_finalized_count_file_chain_1 = format!("{}/data/regular_tx_finalized_count_chain_1.json", base_dir);
-        fs::write(&regular_tx_finalized_count_file_chain_1, serde_json::to_string_pretty(&regular_tx_finalized_count_chain_1).expect("Failed to serialize regular transaction finalized count")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved regular transaction finalized count data to {}", regular_tx_finalized_count_file_chain_1));
-
-        // Save regular transaction timing metrics data from chain 2
-        let regular_tx_avg_latency_chain_2 = serde_json::json!({
-            "chain_2_regular_tx_avg_latency": self.chain_2_regular_tx_avg_latency.iter().map(|(height, latency)| {
-                serde_json::json!({
-                    "height": height,
-                    "latency": latency
-                })
-            }).collect::<Vec<_>>()
-        });
-        let regular_tx_avg_latency_file_chain_2 = format!("{}/data/regular_tx_avg_latency_chain_2.json", base_dir);
-        fs::write(&regular_tx_avg_latency_file_chain_2, serde_json::to_string_pretty(&regular_tx_avg_latency_chain_2).expect("Failed to serialize regular transaction average latency")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved regular transaction average latency data to {}", regular_tx_avg_latency_file_chain_2));
-
-        let regular_tx_max_latency_chain_2 = serde_json::json!({
-            "chain_2_regular_tx_max_latency": self.chain_2_regular_tx_max_latency.iter().map(|(height, latency)| {
-                serde_json::json!({
-                    "height": height,
-                    "latency": latency
-                })
-            }).collect::<Vec<_>>()
-        });
-        let regular_tx_max_latency_file_chain_2 = format!("{}/data/regular_tx_max_latency_chain_2.json", base_dir);
-        fs::write(&regular_tx_max_latency_file_chain_2, serde_json::to_string_pretty(&regular_tx_max_latency_chain_2).expect("Failed to serialize regular transaction max latency")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved regular transaction max latency data to {}", regular_tx_max_latency_file_chain_2));
-
-        let regular_tx_finalized_count_chain_2 = serde_json::json!({
-            "chain_2_regular_tx_finalized_count": self.chain_2_regular_tx_finalized_count.iter().map(|(height, count)| {
-                serde_json::json!({
-                    "height": height,
-                    "count": count
-                })
-            }).collect::<Vec<_>>()
-        });
-        let regular_tx_finalized_count_file_chain_2 = format!("{}/data/regular_tx_finalized_count_chain_2.json", base_dir);
-        fs::write(&regular_tx_finalized_count_file_chain_2, serde_json::to_string_pretty(&regular_tx_finalized_count_chain_2).expect("Failed to serialize regular transaction finalized count")).map_err(|e| e.to_string())?;
-        logging::log("SIMULATOR", &format!("Saved regular transaction finalized count data to {}", regular_tx_finalized_count_file_chain_2));
-
         Ok(())
     }
-} 
+}

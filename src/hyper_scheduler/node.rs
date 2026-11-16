@@ -18,8 +18,23 @@ pub struct HyperSchedulerState {
     pub cat_statuses: HashMap<CATId, CATStatus>,
     /// Map of CAT IDs to their status per constituent chain
     pub cat_chainwise_statuses: HashMap<CATId, HashMap<ChainId, CATStatusLimited>>,
+    /// Message counters used by the simulator to measure communication cost
+    pub message_counts: HSMessageCounts,
+    /// The same counters per CAT
+    pub per_cat_message_counts: HashMap<CATId, HSMessageCounts>,
     /// CATs whose final status has been sent to the CL (each decision is sent exactly once)
     pub decisions_sent: HashSet<CATId>,
+}
+
+/// Counts of the messages the hyper scheduler receives and sends
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HSMessageCounts {
+    /// CAT status proposals received from HIGs (one per constituent chain per CAT)
+    pub proposals_received: u64,
+    /// Status update CL transactions sent to the confirmation layer (one per resolved CAT)
+    pub status_updates_sent: u64,
+    /// Status update sub-transactions inside those CL transactions (one per constituent chain)
+    pub status_update_subtxs_sent: u64,
 }
 
 /// A node that implements the HyperScheduler trait
@@ -51,11 +66,23 @@ impl HyperSchedulerNode {
                 registered_chains: HashSet::new(),
                 constituent_chains: HashMap::new(),
                 cat_chainwise_statuses: HashMap::new(),
+                message_counts: HSMessageCounts::default(),
+                per_cat_message_counts: HashMap::new(),
                 decisions_sent: HashSet::new(),
             })),
             receivers_from_hig: HashMap::new(),
             sender_to_cl: Some(sender_to_cl),
         }
+    }
+
+    /// Get the message counters accumulated since the node was created or last shut down
+    pub async fn get_message_counts(&self) -> HSMessageCounts {
+        self.state.lock().await.message_counts
+    }
+
+    /// Get the message counters of every CAT the scheduler has seen
+    pub async fn get_per_cat_message_counts(&self) -> HashMap<CATId, HSMessageCounts> {
+        self.state.lock().await.per_cat_message_counts.clone()
     }
 
     /// Get a clone of the sender to the confirmation layer
@@ -179,6 +206,8 @@ impl HyperSchedulerNode {
             state.constituent_chains.clear();
             state.cat_statuses.clear();
             state.cat_chainwise_statuses.clear();
+            state.message_counts = HSMessageCounts::default();
+            state.per_cat_message_counts.clear();
             state.decisions_sent.clear();
         }
         
@@ -243,6 +272,11 @@ impl HyperScheduler for HyperSchedulerNode {
         constituent_chains: Vec<ChainId>,
         status: CATStatusLimited,
     ) -> Result<(), HyperSchedulerError> {
+        {
+            let mut state = self.state.lock().await;
+            state.message_counts.proposals_received += 1;
+            state.per_cat_message_counts.entry(cat_id.clone()).or_default().proposals_received += 1;
+        }
         // Validate constituent chains
         if constituent_chains.len() <= 1 {
             return Err(HyperSchedulerError::InvalidCATProposal(
@@ -387,9 +421,18 @@ impl HyperScheduler for HyperSchedulerNode {
             ).expect("Failed to create CL transaction");
             log("HS", &format!("Submitting status update transaction to CL: id={}, chain_ids={:?}", 
                 cl_tx.id.0, cl_tx.constituent_chains.iter().map(|c| c.0.clone()).collect::<Vec<_>>()));
+            let num_subtxs = cl_tx.transactions.len() as u64;
             sender.send(cl_tx)
                 .await
                 .map_err(|e| HyperSchedulerError::Internal(e.to_string()))?;
+            {
+                let mut state = self.state.lock().await;
+                state.message_counts.status_updates_sent += 1;
+                state.message_counts.status_update_subtxs_sent += num_subtxs;
+                let per_cat = state.per_cat_message_counts.entry(cat_id.clone()).or_default();
+                per_cat.status_updates_sent += 1;
+                per_cat.status_update_subtxs_sent += num_subtxs;
+            }
         } else {
             log("HS", "No sender to CL set, cannot send status update");
             return Err(HyperSchedulerError::Internal("No sender to CL set".to_string()));

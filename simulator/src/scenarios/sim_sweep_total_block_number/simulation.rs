@@ -92,6 +92,7 @@ pub async fn run_sweep_total_block_number() -> Result<(), crate::config::ConfigE
                         ratio_cats: base_config.transaction_config.ratio_cats,
                         cat_lifetime_blocks: base_config.transaction_config.cat_lifetime_blocks,
                         allow_cat_pending_dependencies: base_config.transaction_config.allow_cat_pending_dependencies,
+                        cat_span: base_config.transaction_config.cat_span,
                     },
                     simulation_config: crate::config::SimulationConfig {
                         sim_total_block_number: block_number,  // This is the parameter we're varying
