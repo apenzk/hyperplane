@@ -18,6 +18,8 @@ pub struct HyperSchedulerState {
     pub cat_statuses: HashMap<CATId, CATStatus>,
     /// Map of CAT IDs to their status per constituent chain
     pub cat_chainwise_statuses: HashMap<CATId, HashMap<ChainId, CATStatusLimited>>,
+    /// CATs whose final status has been sent to the CL (each decision is sent exactly once)
+    pub decisions_sent: HashSet<CATId>,
 }
 
 /// A node that implements the HyperScheduler trait
@@ -49,6 +51,7 @@ impl HyperSchedulerNode {
                 registered_chains: HashSet::new(),
                 constituent_chains: HashMap::new(),
                 cat_chainwise_statuses: HashMap::new(),
+                decisions_sent: HashSet::new(),
             })),
             receivers_from_hig: HashMap::new(),
             sender_to_cl: Some(sender_to_cl),
@@ -103,11 +106,17 @@ impl HyperSchedulerNode {
                 continue;
             }
 
-            // Get the current status of the CAT
-            let cat_status = node_guard.get_cat_status(status_update.cat_id.clone()).await;
-            if let Ok(status) = cat_status {
-                // Only send status update if we have a final status (Success or Failure)
-                if status != CATStatus::Pending {
+            // Claim the decision under one state lock. Each chain runs its own loop on a separate
+            // node clone, so several loops can observe the same final status; only the first claim sends.
+            let decision = {
+                let mut state = node_guard.state.lock().await;
+                match state.cat_statuses.get(&status_update.cat_id).cloned() {
+                    Some(status) if status != CATStatus::Pending && state.decisions_sent.insert(status_update.cat_id.clone()) => Some(status),
+                    _ => None,
+                }
+            };
+            if let Some(status) = decision {
+                {
                     // Send status update to CL
                     if let Err(e) = node_guard.send_cat_status_update(
                         status_update.cat_id.clone(),
@@ -170,6 +179,7 @@ impl HyperSchedulerNode {
             state.constituent_chains.clear();
             state.cat_statuses.clear();
             state.cat_chainwise_statuses.clear();
+            state.decisions_sent.clear();
         }
         
         // Clear receivers separately to avoid borrowing conflict
