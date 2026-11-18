@@ -86,10 +86,7 @@ pub async fn run_sweep_chain_delay() -> Result<(), crate::config::ConfigError> {
                 crate::config::Config {
                     network_config: crate::config::NetworkConfig {
                         num_chains: base_config.network_config.num_chains,
-                        chain_delays: vec![
-                            base_config.network_config.chain_delays[0],  // Keep first chain delay unchanged
-                            chain_delay,                     // Apply delay to second chain in blocks
-                        ],
+                        chain_delays: { let mut d = base_config.network_config.chain_delays.clone(); d[1] = chain_delay; d },
                         block_interval: base_config.network_config.block_interval,
                         channel_buffer_size: base_config.network_config.channel_buffer_size,
                     },

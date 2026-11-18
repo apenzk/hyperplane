@@ -23,3 +23,6 @@ sysinfo = "0.30"
 [[bin]]
 name = "simulator"
 path = "src/bin/simulator.rs" 
+[[bin]]
+name = "multichain"
+path = "src/bin/multichain.rs"

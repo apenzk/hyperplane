@@ -111,10 +111,7 @@ pub async fn run_sweep_block_interval_all_scaled() -> Result<(), crate::config::
                 crate::config::Config {
                     network_config: crate::config::NetworkConfig {
                         num_chains: base_config.network_config.num_chains,
-                        chain_delays: vec![
-                            base_config.network_config.chain_delays[0],  // Keep first chain delay unchanged
-                            base_config.network_config.chain_delays[1],  // Keep second chain delay constant
-                        ],
+                        chain_delays: base_config.network_config.chain_delays.clone(),
                         block_interval: block_interval,  // Apply the varied block interval
                         channel_buffer_size: base_config.network_config.channel_buffer_size,
                     },
@@ -125,6 +122,7 @@ pub async fn run_sweep_block_interval_all_scaled() -> Result<(), crate::config::
                         ratio_cats: base_config.transaction_config.ratio_cats,
                         cat_lifetime_blocks: base_config.transaction_config.cat_lifetime_blocks,
                         allow_cat_pending_dependencies: base_config.transaction_config.allow_cat_pending_dependencies,
+                        cat_span: base_config.transaction_config.cat_span,
                     },
                     simulation_config: base_config.simulation_config.clone(),
                     logging_config: base_config.logging_config.clone(),

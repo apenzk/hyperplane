@@ -86,10 +86,7 @@ pub async fn run_sweep_block_interval_constant_block_delay() -> Result<(), crate
                 crate::config::Config {
                     network_config: crate::config::NetworkConfig {
                         num_chains: base_config.network_config.num_chains,
-                        chain_delays: vec![
-                            base_config.network_config.chain_delays[0],  // Keep first chain delay unchanged
-                            base_config.network_config.chain_delays[1],  // Use the second chain delay for constant block delay
-                        ],
+                        chain_delays: base_config.network_config.chain_delays.clone(),
                         block_interval: block_interval,                        // Apply the varied block interval
                         channel_buffer_size: base_config.network_config.channel_buffer_size,
                     },

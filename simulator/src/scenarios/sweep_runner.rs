@@ -1,7 +1,6 @@
 use std::fs;
 use chrono::Local;
 use hyperplane::utils::logging;
-use hyperplane::hyper_ig::HyperIG;
 use std::time::{Duration, Instant};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde_json;
@@ -204,7 +203,7 @@ impl<T: std::fmt::Debug + Clone> SweepRunner<T> {
                 let mut results = self.initialize_simulation_results(&sim_config, sim_index, param_value);
 
                 // Setup test nodes with preloaded accounts from config
-                let (hs_node, cl_node, hig_node_1, hig_node_2, _start_block_height) = crate::testnodes::setup_test_nodes(
+                let nodes = crate::testnodes::setup_test_nodes(
                     Duration::from_secs_f64(sim_config.network_config.block_interval),
                     &sim_config.network_config.chain_delays,
                     sim_config.transaction_config.allow_cat_pending_dependencies,
@@ -217,52 +216,21 @@ impl<T: std::fmt::Debug + Clone> SweepRunner<T> {
                 logging::log("SIMULATOR", &format!("Test nodes setup complete with {} accounts preloaded with {} tokens each", 
                     sim_config.account_config.num_accounts, sim_config.account_config.initial_balance));
                 
-                // Query and log account balances to verify preloading (only for first run to avoid spam)
+                // Verify preloading only for the first run to avoid log spam
                 if run == 1 {
-                    logging::log("SIMULATOR", "=== Verifying Preloaded Account Balances ===");
-                    
-                    // Check chain-1 account balances
-                    let chain_1_state = hig_node_1.lock().await.get_chain_state().await.unwrap();
-                    logging::log("SIMULATOR", &format!("Chain-1 state: {} accounts with balances", chain_1_state.len()));
-                    
-                    // Log first few account balances as examples
-                    let mut sorted_accounts: Vec<_> = chain_1_state.iter().collect();
-                    sorted_accounts.sort_by_key(|(account_id, _)| account_id.parse::<u32>().unwrap_or(0));
-                    
-                    for (account_id, balance) in sorted_accounts.iter().take(10) {
-                        logging::log("SIMULATOR", &format!("Chain-1 Account {}: {} tokens", account_id, balance));
-                    }
-                    if sorted_accounts.len() > 10 {
-                        logging::log("SIMULATOR", &format!("... and {} more accounts", sorted_accounts.len() - 10));
-                    }
-                    
-                    // Check chain-2 account balances
-                    let chain_2_state = hig_node_2.lock().await.get_chain_state().await.unwrap();
-                    logging::log("SIMULATOR", &format!("Chain-2 state: {} accounts with balances", chain_2_state.len()));
-                    
-                    // Log first few account balances as examples
-                    let mut sorted_accounts: Vec<_> = chain_2_state.iter().collect();
-                    sorted_accounts.sort_by_key(|(account_id, _)| account_id.parse::<u32>().unwrap_or(0));
-                    
-                    for (account_id, balance) in sorted_accounts.iter().take(10) {
-                        logging::log("SIMULATOR", &format!("Chain-2 Account {}: {} tokens", account_id, balance));
-                    }
-                    if sorted_accounts.len() > 10 {
-                        logging::log("SIMULATOR", &format!("... and {} more accounts", sorted_accounts.len() - 10));
-                    }
-                    
-                    logging::log("SIMULATOR", "=== Account Balance Verification Complete ===");
+                    nodes.log_preloaded_balances().await;
                 }
 
                 // Run simulation
                 let run_message = format!("Sim {} Run {}/{}", sim_index + 1, run, num_runs);
                 let simulation_result = crate::run_simulation::run_simulation_with_message_and_retries(
-                    cl_node.clone(),
-                    vec![hig_node_1.clone(), hig_node_2.clone()],
+                    nodes.cl_node.clone(),
+                    nodes.hig_nodes.clone(),
                     &mut results,
                     Some(run_message),
                     None, // No retry count needed
                 ).await;
+                crate::run_simulation::collect_hs_message_counts(&nodes.hs_node, &mut results).await;
 
                 // Check if simulation failed
                 if let Err(e) = simulation_result {
@@ -283,17 +251,7 @@ impl<T: std::fmt::Debug + Clone> SweepRunner<T> {
                 // Shutdown nodes between runs to prevent state persistence
                 if run < num_runs {
                     logging::log("SIMULATOR", "Shutting down nodes between runs to clear state...");
-                    
-                    // Shutdown HIG nodes
-                    hyperplane::hyper_ig::node::HyperIGNode::shutdown(hig_node_1.clone()).await;
-                    hyperplane::hyper_ig::node::HyperIGNode::shutdown(hig_node_2.clone()).await;
-                    
-                    // Shutdown CL node
-                    hyperplane::confirmation_layer::node::ConfirmationLayerNode::shutdown(cl_node.clone()).await;
-                    
-                    // Shutdown HS node
-                    hyperplane::hyper_scheduler::node::HyperSchedulerNode::shutdown(hs_node.clone()).await;
-                    
+                    nodes.shutdown().await;
                     logging::log("SIMULATOR", "Node shutdown complete");
                 }
 
@@ -509,6 +467,7 @@ impl<T: std::fmt::Debug + Clone> SweepRunner<T> {
         results.cat_lifetime = config.transaction_config.cat_lifetime_blocks;
         results.initialization_wait_blocks = config.simulation_config.initialization_wait_blocks;
         results.chain_delays = config.network_config.chain_delays.clone();
+        results.cat_span = config.transaction_config.cat_span;
         results.start_time = Instant::now();
 
         // Log configuration

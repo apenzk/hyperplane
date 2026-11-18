@@ -92,6 +92,7 @@ pub async fn run_sweep_cat_ratio_simulation() -> Result<(), crate::config::Confi
                         ratio_cats: cat_ratio,  // This is the parameter we're varying
                         cat_lifetime_blocks: base_config.transaction_config.cat_lifetime_blocks,
                         allow_cat_pending_dependencies: base_config.transaction_config.allow_cat_pending_dependencies,
+                        cat_span: base_config.transaction_config.cat_span,
                     },
                     simulation_config: base_config.simulation_config.clone(),
                     logging_config: base_config.logging_config.clone(),

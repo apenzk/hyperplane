@@ -76,6 +76,7 @@ pub async fn run_sweep_cat_lifetime_simulation() -> Result<(), crate::config::Co
                         ratio_cats: base_config.transaction_config.ratio_cats,
                         cat_lifetime_blocks: cat_lifetime,  // This is the parameter we're varying
                         allow_cat_pending_dependencies: base_config.transaction_config.allow_cat_pending_dependencies,
+                        cat_span: base_config.transaction_config.cat_span,
                     },
                     simulation_config: base_config.simulation_config.clone(),
                     logging_config: base_config.logging_config.clone(),
