@@ -1103,6 +1103,23 @@ impl HyperIGNode {
     /// # Arguments
     /// * `completed_tx_id` - The transaction ID of the completed transaction
     /// * `status` - The final status of the transaction
+    /// Sends the status proposal of a CAT that was postponed and has just been re-executed.
+    ///
+    /// The first execution of a CAT sends its proposal from `process_transaction`. A postponed CAT is
+    /// re-executed from `process_pending_transactions` once its blockers resolve; this sends the proposal
+    /// for that second execution, so the hyper scheduler can decide the CAT. A CAT that is still blocked
+    /// keeps the proposed status Pending and sends nothing.
+    async fn send_resumed_cat_proposal(&mut self, tx: &Transaction) -> Result<(), anyhow::Error> {
+        let proposed_status = self.state.lock().await.cat_proposed_statuses.get(&tx.id).cloned();
+        let cat_id = CATId(tx.cl_id.clone());
+        match proposed_status {
+            Some(CATStatus::Success) => self.send_cat_status_proposal(cat_id, CATStatusLimited::Success, tx.constituent_chains.clone()).await?,
+            Some(CATStatus::Failure) => self.send_cat_status_proposal(cat_id, CATStatusLimited::Failure, tx.constituent_chains.clone()).await?,
+            _ => {}
+        }
+        Ok(())
+    }
+
     async fn process_pending_transactions(&mut self, completed_tx_id: TransactionId, _status: TransactionStatus) -> Result<(), anyhow::Error> {
         let chain_id = self.state.lock().await.my_chain_id.0.clone();
         log(&format!("HIG-{}", chain_id), &format!("Processing transactions pending on tx-id='{}'", completed_tx_id.0));
@@ -1195,7 +1212,9 @@ impl HyperIGNode {
                 
                 // Process the transaction directly with skip_lock_check=true since all dependencies are resolved
                 let status = if tx.data.starts_with("CAT") {
-                    self.handle_cat_transaction(tx.clone()).await?
+                    let status = self.handle_cat_transaction(tx.clone()).await?;
+                    self.send_resumed_cat_proposal(&tx).await?;
+                    status
                 } else {
                     self.handle_regular_transaction(tx.clone(), true).await?
                 };
@@ -1274,7 +1293,9 @@ impl HyperIGNode {
                                 
                                 // Process the consumer transaction
                                 let consumer_status = if consumer_tx.data.starts_with("CAT") {
-                                    self.handle_cat_transaction(consumer_tx.clone()).await?
+                                    let status = self.handle_cat_transaction(consumer_tx.clone()).await?;
+                                    self.send_resumed_cat_proposal(&consumer_tx).await?;
+                                    status
                                 } else {
                                     self.handle_regular_transaction(consumer_tx.clone(), true).await?
                                 };
